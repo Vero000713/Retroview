@@ -13,6 +13,10 @@ export interface Item {
   quote: string;
   flagged?: boolean;
   resolved?: boolean;
+  /** 标记已解决的时间戳（ms），取消时清除 */
+  resolvedAt?: number;
+  /** 我的订正笔记 */
+  note?: string;
 }
 
 /** 面试结果状态（按公司维度） */
@@ -67,13 +71,18 @@ export class DataService implements OnModuleInit {
         (i) =>
           i.question.toLowerCase().includes(kw) ||
           i.quote.toLowerCase().includes(kw) ||
-          i.answer_points.join(' ').toLowerCase().includes(kw),
+          i.answer_points.join(' ').toLowerCase().includes(kw) ||
+          (i.note || '').toLowerCase().includes(kw),
       );
     }
     return items;
   }
 
   /** 单场面试视图：题目 + 按分类/掌握度的统计 */
+  getItem(id: string): Item | undefined {
+    return this.items.find((i) => i.id === id);
+  }
+
   getInterview(company: string) {
     const items = this.items.filter((i) => i.company === company);
     if (!items.length) return null;
@@ -124,8 +133,21 @@ export class DataService implements OnModuleInit {
     const it = this.items.find((i) => i.id === id);
     if (!it) return null;
     it.resolved = !it.resolved;
+    if (it.resolved) it.resolvedAt = Date.now();
+    else delete it.resolvedAt;
     this.persist();
     return it.resolved;
+  }
+
+  /** 保存订正笔记，空字符串表示清除；返回保存后的笔记，题目不存在返回 null */
+  setNote(id: string, note: string): string | null {
+    const it = this.items.find((i) => i.id === id);
+    if (!it) return null;
+    const v = String(note ?? '').slice(0, 5000).trim();
+    if (v) it.note = v;
+    else delete it.note;
+    this.persist();
+    return v;
   }
 
   /** 导入新面经：追加知识点与原文切片，重算统计并落盘；status 顺带写入面试状态 */

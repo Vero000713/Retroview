@@ -50,7 +50,7 @@ export class AgentService implements OnModuleInit {
   private retrieveNode(state: typeof AgentState.State) {
     const toks = this.tokenize(state.question);
     const items = this.score(toks, this.data.allItems, (it: any) =>
-      it.question + ' ' + it.answer_points.join(' '), 3,
+      it.question + ' ' + it.answer_points.join(' ') + ' ' + (it.note || ''), 3,
     ).slice(0, 8);
     const chunks = this.score(toks, this.data.allChunks, (c: any) => c.text, 1).slice(0, 5);
 
@@ -58,7 +58,7 @@ export class AgentService implements OnModuleInit {
     const context = [
       '===== 结构化知识点 =====',
       ...items.map((it: any) =>
-        `【${it.company}·${it.round}·${catMap[it.category] || it.category}·${it.quality}】\n问：${it.question}\n答要点：${it.answer_points.join('；')}`),
+        `【${it.company}·${it.round}·${catMap[it.category] || it.category}·${it.quality}】\n问：${it.question}\n答要点：${it.answer_points.join('；')}${it.note ? `\n我的订正笔记：${it.note}` : ''}`),
       '',
       '===== 面试原文节选 =====',
       ...chunks.map((c: any) => `【${c.company}原文】${c.text}`),

@@ -1,521 +1,334 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { fetchStats, fetchAllItems, deleteItems, deleteInterview, toggleFlag, toggleResolve, setInterviewStatus } from './api.js';
-import ListView from './components/ListView.jsx';
-import InterviewView from './components/InterviewView.jsx';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  fetchStats, fetchAllItems, deleteItems, deleteInterview, toggleFlag, toggleResolve, setInterviewStatus, saveNote,
+} from './api.js';
+import Sidebar from './components/Sidebar.jsx';
+import ItemsView from './components/ItemsView.jsx';
 import Chat from './components/Chat.jsx';
 import ImportDialog from './components/ImportDialog.jsx';
 import Dashboard from './components/Dashboard.jsx';
-import ConfirmDialog from './components/ConfirmDialog.jsx';
-import { CATEGORIES, CAT_MAP, QMETA, INTERVIEW_STATUS, setCategories, findFreqGroups } from './components/constants.js';
+import ConfirmDialog, { Modal } from './components/ConfirmDialog.jsx';
+import ReviewMode from './components/ReviewMode.jsx';
+import Icon from './components/Icon.jsx';
+import { useToast } from './components/Toast.jsx';
+import { QMETA, catOf, setCategories, findFreqGroups, viewFromHash, hashFromView } from './components/constants.js';
+
+const SHORTCUTS = [
+  ['/', '搜索题目'],
+  ['j / k', '在列表里上下移动'],
+  ['Enter', '展开 / 收起当前题'],
+  ['e', '标记 / 取消已解决'],
+  ['f', '标记 / 取消重点'],
+  ['a', '问 AI 当前这道题'],
+  ['空格', '复习模式：显示答案'],
+  ['1 / 2', '复习模式：还不会 / 会了'],
+  ['Esc', '关闭弹窗、面板或复习'],
+  ['?', '打开这个列表'],
+];
+
+const titleOfView = (v) =>
+  v.type === 'chat' ? '问答助手'
+  : v.type === 'overview' ? '全部题目'
+  : v.type === 'category' ? catOf(v.id).label
+  : v.type === 'interview' ? `${v.company} 复盘`
+  : '复习首页';
 
 export default function App() {
+  const toast = useToast();
   const [stats, setStats] = useState(null);
   const [allItems, setAllItems] = useState([]);
-  const [view, setView] = useState({ type: 'home' }); // home | overview | category | interview | chat
-  const [search, setSearch] = useState('');
-  const [weakOnly, setWeakOnly] = useState(false);
-  const [qualityFilter, setQualityFilter] = useState(null); // null | good | partial | poor
-  const [flaggedOnly, setFlaggedOnly] = useState(false);    // 只看红旗标记
-  const [catFilter, setCatFilter] = useState('all');        // 单场面试视图：分类下拉筛选
-  const [openIds, setOpenIds] = useState(new Set());
+  const itemsRef = useRef(allItems);
+  itemsRef.current = allItems;
+  const [loadState, setLoadState] = useState('loading'); // loading | ready | error
+  const [loadError, setLoadError] = useState('');
+  const [view, setView] = useState(viewFromHash);
+  const viewRef = useRef(view);
+  const [navOpen, setNavOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-
-  // 批量删除
-  const [selectMode, setSelectMode] = useState(false);
-  const [selection, setSelection] = useState(new Set());
-  const [deleting, setDeleting] = useState(false);
-
-  // 删除整场面试（悬浮垃圾桶 → 确认弹窗）
-  const [delCompany, setDelCompany] = useState(null); // 待删除的公司名，null 表示弹窗关闭
+  const [delCompany, setDelCompany] = useState(null);
   const [delBusy, setDelBusy] = useState(false);
+  const [review, setReview] = useState(null); // { items, title }
+  const [ask, setAsk] = useState(null);       // { text, title, n }
+  const [helpOpen, setHelpOpen] = useState(false);
+  const mainRef = useRef(null);
+  const nonce = useRef(0);
 
+  const applyStats = (s) => { setCategories(s.categories); setStats(s); };
+
+  const load = useCallback(async () => {
+    setLoadState('loading');
+    try {
+      const [s, items] = await Promise.all([fetchStats(), fetchAllItems()]);
+      applyStats(s);
+      setAllItems(items);
+      setLoadState('ready');
+    } catch (e) {
+      setLoadError(e.message);
+      setLoadState('error');
+    }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  // ===== 路由：视图 <-> location.hash =====
+  const navigate = useCallback((v) => {
+    viewRef.current = v;
+    setView(v);
+    const h = hashFromView(v);
+    if (window.location.hash !== h) window.location.hash = h;
+  }, []);
   useEffect(() => {
-    fetchStats().then((s) => { setStats(s); setCategories(s.categories); }).catch(console.error);
-    fetchAllItems().then(setAllItems).catch(console.error);
+    const onHash = () => {
+      const v = viewFromHash();
+      if (hashFromView(v) !== hashFromView(viewRef.current)) { viewRef.current = v; setView(v); }
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
   }, []);
 
-  // 切换视图时重置分类下拉
-  useEffect(() => setCatFilter('all'), [view]);
+  // 切换视图：回到顶部（定位到某题时由列表自己滚动），更新标签页标题
+  useEffect(() => {
+    if (!view.focus) mainRef.current?.scrollTo(0, 0);
+    document.title = `${titleOfView(view)} · 面经错题本`;
+  }, [view]);
 
-  const toggleCard = (id) =>
-    setOpenIds((prev) => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
-    });
-
-  const toggleSelect = (id, checked) =>
-    setSelection((prev) => {
-      const next = new Set(prev);
-      checked ? next.add(id) : next.delete(id);
-      return next;
-    });
-
-  const doDelete = async () => {
-    if (!selection.size || deleting) return;
-    if (!window.confirm(`确认删除选中的 ${selection.size} 条题目？删除后不可恢复（原文切片保留）。`)) return;
-    setDeleting(true);
+  // ===== 数据操作（先改界面，失败再回滚） =====
+  const toggleField = (field, api, label) => async function run(id) {
+    const cur = itemsRef.current.find((i) => i.id === id);
+    if (!cur) return;
+    const next = !cur[field];
+    const setTo = (val) => setAllItems((items) => items.map((i) => (i.id === id ? { ...i, [field]: val } : i)));
+    setTo(next);
     try {
-      const ids = [...selection];
-      await deleteItems(ids);
-      setAllItems((items) => items.filter((i) => !ids.includes(i.id)));
-      setStats(await fetchStats());
-      setSelection(new Set());
-      setSelectMode(false);
+      const r = await api(id);
+      setTo(r[field]);
+      if (field === 'resolved') {
+        setAllItems((items) => items.map((i) => (i.id === id ? { ...i, resolvedAt: r.resolvedAt } : i)));
+      }
+      if (field === 'resolved' && r[field] && !document.querySelector('.review')) {
+        toast('已标记为已解决', { tone: 'good', action: { label: '撤销', onClick: () => run(id) } });
+      }
     } catch (e) {
-      alert('删除失败：' + e.message);
-    } finally {
-      setDeleting(false);
+      setTo(!next);
+      toast(`${label}失败：${e.message}`, { tone: 'error' });
+    }
+  };
+  const handleToggleResolve = toggleField('resolved', toggleResolve, '标记');
+  const handleToggleFlag = toggleField('flagged', toggleFlag, '标记');
+
+  /** 设为指定状态（复习模式用），已经是目标状态就不发请求 */
+  const setResolved = (id, val) => {
+    const cur = itemsRef.current.find((i) => i.id === id);
+    if (cur && !!cur.resolved !== val) handleToggleResolve(id);
+  };
+
+  const handleSaveNote = async (id, note) => {
+    try {
+      const r = await saveNote(id, note);
+      setAllItems((items) => items.map((i) => (i.id === id ? { ...i, note: r.note || undefined } : i)));
+      return true;
+    } catch (e) {
+      toast(`保存订正失败：${e.message}`, { tone: 'error' });
+      return false;
     }
   };
 
-  /** 确认删除整场面试：调后端接口，本地同步移除并刷新统计 */
+  /** 针对某道题问 AI：打开问答面板，在新对话里发出 */
+  const askAbout = (item) => {
+    const lines = [
+      `这道面试题我当时${QMETA[item.quality].label}，请帮我给出一个更完整、适合面试口述的回答，并指出我漏掉的关键点。`,
+      `题目：${item.question}`,
+      `我当时答到的点：${item.answer_points.join('；')}`,
+    ];
+    if (item.note) lines.push(`我自己的订正：${item.note}`);
+    setReview(null);
+    if (viewRef.current.type !== 'chat') setChatOpen(true);
+    setAsk({ text: lines.join('\n'), title: item.question.slice(0, 24), n: Date.now() });
+  };
+
+  const startReview = (items, title) => {
+    if (!items.length) return;
+    setChatOpen(false);
+    setReview({ items, title });
+  };
+
+  // 全局快捷键：? 打开快捷键列表
+  useEffect(() => {
+    const h = (e) => {
+      if (/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName)) return;
+      if (e.key === '?') { e.preventDefault(); setHelpOpen((v) => !v); }
+    };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, []);
+
+  const handleDeleteItems = async (ids) => {
+    try {
+      const r = await deleteItems(ids);
+      setAllItems((items) => items.filter((i) => !ids.includes(i.id)));
+      if (r?.stats) applyStats(r.stats);
+      toast(`已删除 ${r?.removed ?? ids.length} 道题`);
+      return true;
+    } catch (e) {
+      toast(`删除失败：${e.message}`, { tone: 'error' });
+      return false;
+    }
+  };
+
   const doDeleteInterview = async () => {
     if (!delCompany || delBusy) return;
     setDelBusy(true);
+    const company = delCompany;
     try {
-      const r = await deleteInterview(delCompany);
-      const company = delCompany;
+      const r = await deleteInterview(company);
       setAllItems((items) => items.filter((i) => i.company !== company));
-      if (r?.stats) {
-        setStats(r.stats);
-        setCategories(r.stats.categories);
-      }
-      if (view.type === 'interview' && view.company === company) setView({ type: 'home' });
+      if (r?.stats) applyStats(r.stats);
+      if (viewRef.current.type === 'interview' && viewRef.current.company === company) navigate({ type: 'home' });
       setDelCompany(null);
+      toast(`已删除「${company}」整场面试`);
     } catch (e) {
-      alert('删除失败：' + (e.message || '请确认后端服务已启动'));
+      toast(`删除失败：${e.message}`, { tone: 'error' });
     } finally {
       setDelBusy(false);
     }
   };
 
-  /** 已解决标记切换：调后端持久化，本地同步 + 轻提示 */
-  const handleToggleResolve = async (id) => {
-    try {
-      const r = await toggleResolve(id);
-      if (r.ok) {
-        setAllItems((items) => items.map((i) => (i.id === id ? { ...i, resolved: r.resolved } : i)));
-      }
-    } catch {
-      alert('标记失败，请确认后端服务已启动');
-    }
-  };
-
-  /** 设置面试结果状态：调后端持久化，本地同步统计里的 interviews 表 */
   const handleSetStatus = async (company, status) => {
     try {
       const r = await setInterviewStatus(company, status);
-      if (r.stats) {
-        setStats(r.stats);
-        setCategories(r.stats.categories);
-      }
+      if (r.stats) applyStats(r.stats);
     } catch (e) {
-      alert('状态更新失败：' + e.message);
+      toast(`更新结果失败：${e.message}`, { tone: 'error' });
     }
   };
 
-  /** 红旗标记切换：调后端持久化，本地同步 */
-  const handleToggleFlag = async (id) => {
-    try {
-      const r = await toggleFlag(id);
-      if (r.ok) {
-        setAllItems((items) => items.map((i) => (i.id === id ? { ...i, flagged: r.flagged } : i)));
-      }
-    } catch {
-      alert('标记失败，请确认后端服务已启动');
-    }
+  /** 从首页 / 问答跳到具体题目：进入该题所在的面试复盘并展开定位 */
+  const gotoItem = (ref) => {
+    const item = allItems.find((i) => i.id === ref.id);
+    if (!item) { toast('这道题已被删除', { tone: 'error' }); return; }
+    setChatOpen(false);
+    navigate({ type: 'interview', company: item.company, focus: item.id, n: ++nonce.current });
   };
 
-  // ===== 当前视图数据 =====
-  const filtered = useMemo(() => {
-    let items = allItems;
-    if (view.type === 'category') items = items.filter((i) => i.category === view.id);
-    if (view.type === 'interview') {
-      items = items.filter((i) => i.company === view.company);
-      if (catFilter !== 'all') items = items.filter((i) => i.category === catFilter);
-    }
-    if (qualityFilter) items = items.filter((i) => i.quality === qualityFilter);
-    else if (weakOnly) items = items.filter((i) => i.quality !== 'good');
-    if (flaggedOnly) items = items.filter((i) => i.flagged);
-    if (search.trim()) {
-      const kw = search.trim().toLowerCase();
-      items = items.filter((i) =>
-        i.question.toLowerCase().includes(kw) ||
-        i.quote.toLowerCase().includes(kw) ||
-        i.answer_points.join(' ').toLowerCase().includes(kw),
-      );
-    }
-    return items;
-  }, [allItems, view, weakOnly, qualityFilter, flaggedOnly, catFilter, search]);
-
-  const interview = useMemo(() => {
-    if (view.type !== 'interview') return null;
-    const items = allItems.filter((i) => i.company === view.company);
-    const byCategory = {};
-    const byQuality = {};
-    for (const it of items) {
-      byCategory[it.category] = (byCategory[it.category] || 0) + 1;
-      byQuality[it.quality] = (byQuality[it.quality] || 0) + 1;
-    }
-    return {
-      company: view.company,
-      round: items[0]?.round,
-      total: items.length,
-      byCategory,
-      byQuality,
-      items,
-    };
-  }, [view, allItems]);
+  const handleImported = async (r) => {
+    if (r?.stats) applyStats(r.stats);
+    try { setAllItems(await fetchAllItems()); } catch { /* 下次刷新再取 */ }
+  };
 
   const freqGroups = useMemo(() => findFreqGroups(allItems), [allItems]);
 
-  /** 聊天会话隔离：首页/总览/每个分类/每场面试 各自独立会话 */
-  const chatSessionId =
-    view.type === 'chat' ? 'home'
-    : view.type === 'category' ? `cat:${view.id}`
-    : view.type === 'interview' ? `interview:${view.company}`
-    : 'overview';
-  const chatSessionLabel =
-    view.type === 'chat' ? '首页会话'
-    : view.type === 'category' ? CATEGORIES.find((c) => c.id === view.id)?.label
-    : view.type === 'interview' ? view.company
-    : '全部题目';
+  const isChatPage = view.type === 'chat';
+  const itemsKey = `${hashFromView(view)}|${view.q || ''}|${view.focus || ''}|${view.n || ''}`;
 
-  const gotoItem = (ref) => {
-    // 从聊天/首页跳转：定位到该题（切到 overview + 展开卡片）
-    const item = allItems.find((i) => i.id === ref.id);
-    if (!item) return;
-    setView({ type: 'overview' });
-    setQualityFilter(null);
-    setWeakOnly(false);
-    setSearch('');
-    setOpenIds(new Set([item.id]));
-    setChatOpen(false);
-    setTimeout(() => {
-      document.getElementById(`card-${item.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }, 120);
-  };
-
-  /** 当前视图的静态题目集（分类视图按分类、面试视图按公司，其余为全部；不随筛选/搜索变化） */
-  const viewItems = useMemo(() => {
-    if (view.type === 'category') return allItems.filter((i) => i.category === view.id);
-    if (view.type === 'interview') return allItems.filter((i) => i.company === view.company);
-    return allItems;
-  }, [allItems, view]);
-
-  /** 掌握度计数：基于静态视图集合，点击筛选不改变显示数量 */
-  const qualityCount = (q) => viewItems.filter((i) => i.quality === q).length;
-
-  /** 点击掌握度卡片：切换筛选；再点一次取消 */
-  const toggleQuality = (q) => {
-    setQualityFilter((prev) => (prev === q ? null : q));
-    setWeakOnly(false);
-  };
-
-  /** 上传导入成功后刷新首页数据 */
-  const handleImported = async () => {
-    const s = await fetchStats();
-    setStats(s);
-    setCategories(s.categories);
-    setAllItems(await fetchAllItems());
-  };
+  let content;
+  if (loadState === 'loading' && !stats) {
+    content = (
+      <div className="skeleton" aria-busy="true" aria-label="正在加载">
+        <div className="sk sk-title" /><div className="sk sk-line" />
+        {Array.from({ length: 6 }, (_, i) => <div className="sk sk-row" key={i} />)}
+      </div>
+    );
+  } else if (loadState === 'error') {
+    content = (
+      <div className="empty big" role="alert">
+        <p><b>没能读取面经数据。</b></p>
+        <p className="muted">{loadError}</p>
+        <button className="btn primary" onClick={load}>重试</button>
+      </div>
+    );
+  } else if (view.type === 'home') {
+    content = (
+      <Dashboard
+        stats={stats} allItems={allItems} freqGroups={freqGroups}
+        onNavigate={navigate}
+        onOpenImport={() => setImportOpen(true)}
+        onJumpToItem={gotoItem}
+        onStartReview={startReview}
+      />
+    );
+  } else if (!isChatPage) {
+    content = (
+      <ItemsView
+        key={itemsKey}
+        view={view} allItems={allItems} stats={stats} freqGroups={freqGroups}
+        focusId={view.focus}
+        onToggleFlag={handleToggleFlag}
+        onToggleResolve={handleToggleResolve}
+        onDeleteItems={handleDeleteItems}
+        onSetStatus={handleSetStatus}
+        onJumpToItem={gotoItem}
+        onSaveNote={handleSaveNote}
+        onAsk={askAbout}
+        onStartReview={startReview}
+      />
+    );
+  }
 
   return (
     <div className="app">
-      {/* ===== 侧栏 ===== */}
-      <aside className="sidebar">
-        <div className="brand">
-          <h1><span className="logo">面</span>面经复盘知识库</h1>
-          <p>
-            {stats ? `${stats.total} 个知识点 · ${stats.companies?.length || 0} 家公司` : '加载中…'}
-          </p>
-        </div>
-        <div className="nav-section">
-          <div className="nav-title">导航</div>
-          <div
-            className={`cat-item ${view.type === 'home' ? 'active' : ''}`}
-            onClick={() => setView({ type: 'home' })}
-          >
-            <span className="cat-dot" style={{ background: '#111827' }} />
-            <span className="name">首页 · Dashboard</span>
-          </div>
-          <div
-            className={`cat-item ${view.type === 'chat' ? 'active' : ''}`}
-            onClick={() => { setView({ type: 'chat' }); setChatOpen(false); }}
-          >
-            <span className="cat-dot" style={{ background: '#7c5cff' }} />
-            <span className="name">💬 问答机器人</span>
-          </div>
-        </div>
-        <div className="nav-section">
-          <div className="nav-title">分类</div>
-          <div
-            className={`cat-item ${view.type === 'overview' ? 'active' : ''}`}
-            onClick={() => setView({ type: 'overview' })}
-          >
-            <span className="cat-dot" style={{ background: '#4f6ef7' }} />
-            <span className="name">全部</span>
-            <span className="count">{allItems.length}</span>
-          </div>
-          {CATEGORIES.map((c) => (
-            <div
-              key={c.id}
-              className={`cat-item ${view.type === 'category' && view.id === c.id ? 'active' : ''}`}
-              onClick={() => setView({ type: 'category', id: c.id })}
-            >
-              <span className="cat-dot" style={{ background: c.color }} />
-              <span className="name">{c.label}</span>
-              <span className="count">{stats?.byCategory?.[c.id] || 0}</span>
-            </div>
-          ))}
-        </div>
-        <div className="nav-section">
-          <div className="nav-title">单场面试</div>
-          {Object.entries(stats?.byCompany || {}).map(([company, n]) => (
-            <div
-              key={company}
-              className={`cat-item ${view.type === 'interview' && view.company === company ? 'active' : ''}`}
-              onClick={() => setView({ type: 'interview', company })}
-            >
-              <span className="cat-dot" style={{ background: '#94a3b8' }} />
-              <span className="name">{company} · {allItems.find((i) => i.company === company)?.round || '面试'}</span>
-              {stats?.interviews?.[company] && (
-                <span
-                  className="iv-status"
-                  style={{ color: INTERVIEW_STATUS[stats.interviews[company]]?.color }}
-                >
-                  {INTERVIEW_STATUS[stats.interviews[company]]?.label}
-                </span>
-              )}
-              <span className="count">{n}</span>
-              <button
-                className="cat-del"
-                title={`删除「${company}」整场面试`}
-                onClick={(e) => { e.stopPropagation(); setDelCompany(company); }}
-              >
-                🗑
-              </button>
-            </div>
-          ))}
-        </div>
-      </aside>
+      <a className="skip-link" href="#main">跳到正文</a>
+      <Sidebar
+        stats={stats} allItems={allItems} view={view}
+        open={navOpen}
+        onNavigate={navigate}
+        onDeleteCompany={setDelCompany}
+        onClose={() => setNavOpen(false)}
+        onShowShortcuts={() => setHelpOpen(true)}
+      />
 
-      {/* ===== 主区 ===== */}
-      <main className="main">
-        <div className="main-inner">
-          {view.type === 'home' ? (
-            <Dashboard
-              stats={stats}
-              allItems={allItems}
-              onSelectCategory={(id) => setView({ type: 'category', id })}
-              onSelectCompany={(company) => setView({ type: 'interview', company })}
-              onDeleteCompany={setDelCompany}
-              onOpenChat={() => setView({ type: 'chat' })}
-              onOpenImport={() => setImportOpen(true)}
-              onJumpToItem={gotoItem}
-            />
-          ) : view.type === 'chat' ? null : (
-          <>
-          {/* 工具条 */}
-          <div className="toolbar">
-            <div className="search-box">
-              <span style={{ color: '#94a3b8' }}>🔍</span>
-              <input
-                value={search}
-                placeholder="搜索问题、知识点、原文…（如：闭包、SSE、diff）"
-                onChange={(e) => setSearch(e.target.value)}
-              />
-            </div>
-            {view.type === 'interview' && (
-              <select
-                className="cat-select"
-                value={catFilter}
-                onChange={(e) => setCatFilter(e.target.value)}
-                title="按分类筛选本场面试的题目"
-              >
-                <option value="all">全部分类</option>
-                {Object.entries(interview?.byCategory || {})
-                  .sort((a, b) => b[1] - a[1])
-                  .map(([id, n]) => (
-                    <option key={id} value={id}>
-                      {CAT_MAP[id]?.label || id}（{n}）
-                    </option>
-                  ))}
-              </select>
-            )}
-            <button
-              className={`btn ${weakOnly ? 'primary' : ''}`}
-              onClick={() => { setQualityFilter(null); setWeakOnly(!weakOnly); }}
-            >
-              只看没答好的
-            </button>
-            <button
-              className={`btn ${flaggedOnly ? 'primary' : ''}`}
-              onClick={() => setFlaggedOnly(!flaggedOnly)}
-            >
-              🚩 只看标记{flaggedOnly ? '' : ` (${viewItems.filter((i) => i.flagged).length})`}
-            </button>
-            {view.type !== 'interview' && (
-              <button
-                className={`btn ${selectMode ? 'primary' : ''}`}
-                onClick={() => { setSelectMode(!selectMode); setSelection(new Set()); }}
-              >
-                {selectMode ? '退出批量' : '批量管理'}
-              </button>
-            )}
-            {selectMode && (
-              <>
-                <span style={{ color: 'var(--muted)', fontSize: 13 }}>
-                  已选 {selection.size} 项
-                </span>
-                <button
-                  className="btn danger"
-                  disabled={!selection.size || deleting}
-                  onClick={doDelete}
-                >
-                  {deleting ? '删除中…' : `删除选中(${selection.size})`}
-                </button>
-              </>
-            )}
-          </div>
-
-          {/* 掌握度统计卡片（搜索框下方；数量固定为当前视图的静态统计，点击仅切换筛选） */}
-          <div className="stats-row">
-              <div
-                className={`stat-card clickable ${!qualityFilter && !weakOnly ? 'active' : ''}`}
-                title="点击查看全部题目"
-                onClick={() => { setQualityFilter(null); setWeakOnly(false); }}
-              >
-                <div className="num" style={{ color: '#4f6ef7' }}>{viewItems.length}</div>
-                <div className="lbl">总数量</div>
-              </div>
-              {Object.entries(QMETA).map(([q, m]) => (
-                <div
-                  className={`stat-card clickable ${qualityFilter === q ? 'active' : ''}`}
-                  key={q}
-                  title="点击只看该掌握度的题目，再次点击取消"
-                  onClick={() => toggleQuality(q)}
-                >
-                  <div className="num" style={{ color: m.color }}>{qualityCount(q)}</div>
-                  <div className="lbl">{m.label}</div>
-                </div>
-              ))}
-          </div>
-
-          {/* 高频考点（仅总览） */}
-          {view.type === 'overview' && (
-            <>
-              <div className="section-head">
-                <h2>高频考点</h2>
-                <span className="sub">多家公司都问到的题，优先复习</span>
-              </div>
-              <div className="freq-grid">
-                {freqGroups.map((g, i) => {
-                  const companies = [...new Set(g.map((x) => x.company))];
-                  return (
-                    <div
-                      className="freq-card" key={i}
-                      onClick={() => gotoItem({ id: g[0].id })}
-                    >
-                      <div className="fq">{g[0].question}</div>
-                      <div className="companies">
-                        {companies.map((c) => <span className="tag" key={c}>{c}</span>)}
-                        <span className="tag hot">被问 {g.length} 次</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </>
-          )}
-
-          {/* 列表标题 */}
-          <div className="section-head">
-            <h2>
-              {view.type === 'category' ? CATEGORIES.find((c) => c.id === view.id)?.label
-                : view.type === 'interview'
-                  ? `${view.company} · ${allItems.find((i) => i.company === view.company)?.round || '面试'} · 复盘`
-                : '全部题目'}
-            </h2>
-            <span className="sub">
-              共 {filtered.length} 题
-            </span>
-            {view.type === 'interview' && (
-              <select
-                className="status-select"
-                value={stats?.interviews?.[view.company] || ''}
-                onChange={(e) => handleSetStatus(view.company, e.target.value)}
-                title="设置这场面试的结果状态"
-              >
-                <option value="">状态未标记</option>
-                {Object.entries(INTERVIEW_STATUS).map(([id, s]) => (
-                  <option key={id} value={id}>{s.label}</option>
-                ))}
-              </select>
-            )}
-          </div>
-
-          {/* 视图内容 */}
-          {view.type === 'interview' ? (
-            <InterviewView
-              interview={interview ? { ...interview, items: filtered } : null}
-              selectMode={selectMode}
-              onToggleSelectMode={() => { setSelectMode(!selectMode); setSelection(new Set()); }}
-              selection={selection}
-              onToggleSelect={toggleSelect}
-              onToggleCard={toggleCard}
-              openIds={openIds}
-              onToggleFlag={handleToggleFlag}
-              onToggleResolve={handleToggleResolve}
-            />
-          ) : (
-            <ListView
-              items={filtered}
-              grouped={view.type === 'category'}
-              selectMode={selectMode}
-              selection={selection}
-              onToggleSelect={toggleSelect}
-              onToggleCard={toggleCard}
-              openIds={openIds}
-              onToggleFlag={handleToggleFlag}
-              onToggleResolve={handleToggleResolve}
-            />
-          )}
-          </>
-          )}
+      <main className="main" id="main" ref={mainRef}>
+        <div className="topbar only-mobile">
+          <button className="icon-btn" onClick={() => setNavOpen(true)} aria-label="打开导航"><Icon name="menu" /></button>
+          <span className="topbar-title">面经错题本</span>
         </div>
+        <div className="main-inner">{content}</div>
       </main>
 
       <Chat
-        sessionId={chatSessionId}
-        sessionLabel={chatSessionLabel}
-        variant={view.type === 'chat' ? 'page' : 'panel'}
+        variant={isChatPage ? 'page' : 'panel'}
         open={chatOpen}
         onOpen={() => setChatOpen(true)}
-        onClose={() => {
-          if (view.type === 'chat') setView({ type: 'home' });
-          else setChatOpen(false);
-        }}
+        onClose={() => (isChatPage ? navigate({ type: 'home' }) : setChatOpen(false))}
         onJumpToItem={gotoItem}
+        ask={ask}
       />
+
+      {review && (
+        <ReviewMode
+          items={review.items}
+          title={review.title}
+          liveItems={allItems}
+          onSetResolved={setResolved}
+          onToggleFlag={handleToggleFlag}
+          onAsk={askAbout}
+          onClose={() => setReview(null)}
+        />
+      )}
+
+      <Modal open={helpOpen} title="快捷键" onClose={() => setHelpOpen(false)} className="help-modal">
+        <dl className="shortcuts">
+          {SHORTCUTS.map(([k, d]) => (
+            <div key={k}><dt>{k.split(' / ').map((x, i) => <React.Fragment key={x}>{i > 0 && ' / '}<kbd>{x}</kbd></React.Fragment>)}</dt><dd>{d}</dd></div>
+          ))}
+        </dl>
+      </Modal>
 
       <ImportDialog
         open={importOpen}
         onClose={() => setImportOpen(false)}
         onImported={handleImported}
+        onView={(company) => navigate({ type: 'interview', company })}
       />
 
       <ConfirmDialog
         open={!!delCompany}
         title="删除整场面试"
-        message={`确认删除「${delCompany || ''}」的整场面试？\n该场所有题目与原文切片都会被删除，不可恢复。`}
-        confirmText={delBusy ? '删除中…' : '删除'}
+        message={`删除「${delCompany || ''}」整场面试？这场的所有题目和面试原文都会删除，无法恢复。`}
+        confirmText="删除整场"
         danger
         busy={delBusy}
         onConfirm={doDeleteInterview}
-        onClose={() => { if (!delBusy) setDelCompany(null); }}
+        onClose={() => setDelCompany(null)}
       />
     </div>
   );

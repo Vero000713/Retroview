@@ -39,7 +39,15 @@ export class DataController {
   toggleResolve(@Param('id') id: string) {
     const resolved = this.data.toggleResolve(id);
     if (resolved === null) return { ok: false, message: '题目不存在' };
-    return { ok: true, resolved };
+    return { ok: true, resolved, resolvedAt: this.data.getItem(id)?.resolvedAt };
+  }
+
+  /** 保存订正笔记 */
+  @Post('items/:id/note')
+  setNote(@Param('id') id: string, @Body() body: { note?: string }) {
+    const note = this.data.setNote(id, body?.note || '');
+    if (note === null) return { ok: false, message: '题目不存在' };
+    return { ok: true, note };
   }
 
   /** 设置单场面试的结果状态（通过/泡池子/挂），空 status 表示清除 */
